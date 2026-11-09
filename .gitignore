@@ -1,0 +1,4 @@
+firmware/*/build/
+firmware/*/build-release/
+__pycache__/
+.pytest_cache/
