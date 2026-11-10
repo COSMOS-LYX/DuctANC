@@ -13,8 +13,8 @@ endif()
 set(CMAKE_C_FLAGS_DEBUG "-Og -g3")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -g")
 
-# 蓝牙模块波特率（JDY-31 出厂 9600；用 AT+BAUD8 改成 115200 后在这里同步）
-set(BT_BAUD 9600 CACHE STRING "USART1 baud rate for the Bluetooth module")
+# 蓝牙模块波特率（JDY-31 出厂 9600，固件开机时用 AT+BAUDn 自动改成这里的值）
+set(BT_BAUD 115200 CACHE STRING "USART1 baud rate for the Bluetooth module")
 # 采样率，ADC 与 DAC 共用 TIM2 触发
 set(FS_HZ 8000 CACHE STRING "Sample rate in Hz")
 
@@ -49,6 +49,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
   BT_BAUD=${BT_BAUD} FS_HZ=${FS_HZ})
 
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/User/app.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/User/anc.c
   ${CMAKE_CURRENT_SOURCE_DIR}/User/audio.c
   ${CMAKE_CURRENT_SOURCE_DIR}/User/bsp.c
   ${CMAKE_CURRENT_SOURCE_DIR}/User/bt_uart.c

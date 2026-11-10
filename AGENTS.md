@@ -4,7 +4,7 @@
 
 ## 硬件
 - STM32F407VET6 黑色最小系统板，8 MHz HSE，原理图 `资料/数据手册/开发板原理图_stm32f407v.pdf`
-- 蓝牙 JDY-31（SPP）接 USART1 PA9/PA10，默认 9600；麦 MAX4466 → PC0（参考）/PC1（误差）；DAC PA4 → PAM8403
+- 蓝牙 JDY-31（SPP）接 USART1 PA9/PA10，115200（出厂 9600，固件开机时在未连接状态下用 AT+BAUD8 自动改；已有 build/ 时用 `-DBT_BAUD=115200` 覆盖 CMake 缓存）；麦 MAX4466 → PC0（参考）/PC1（误差）；DAC PA4 → PAM8403
 
 ## 固件 firmware/hwtest（StdPeriph V1.9.0 + FreeRTOS V10.3.1）
 - 工具链：STM32CubeCLT（`D:\Tools\Stm32CubeCLT\STM32CubeCLT_1.22.0`，已在 PATH）

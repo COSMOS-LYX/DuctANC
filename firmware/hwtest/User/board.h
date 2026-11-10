@@ -4,11 +4,12 @@
 
 #include "stm32f4xx.h"
 
-#define FW_NAME "duct-anc-hwtest-0.1" /* 不含空格，INFO 行按 key=value 解析 */
+#define FW_NAME "duct-anc-hwtest-0.3" /* 不含空格，INFO 行按 key=value 解析 */
 
 #ifndef BT_BAUD
-#define BT_BAUD 9600
+#define BT_BAUD 115200
 #endif
+#define BT_BAUD_FACTORY 9600 /* JDY-31 出厂波特率，开机自动改成 BT_BAUD */
 #ifndef FS_HZ
 #define FS_HZ 8000
 #endif

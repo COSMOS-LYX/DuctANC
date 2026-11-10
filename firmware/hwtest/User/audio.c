@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "anc.h"
+
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -20,11 +22,21 @@
 
 static uint16_t adc_buf[ADC_LEN];
 static uint16_t dac_buf[DAC_LEN];
-static uint16_t cap_buf[CAP_MAX * AUDIO_NCH] __attribute__((section(".ccmram")));
+static uint16_t cap_buf[CAP_SAMPLES] __attribute__((section(".ccmram")));
+/*
+ * DAC 半缓冲被 DMA 读完、重新填写之前的快照。
+ * DAC 带 DMA 时，第 j 个触发把 DHR 送到输出再由 DMA 装入 dac_buf[j]，所以 dac_buf[j] 从第 j+1 个触发起输出；
+ * ADC 第 k 帧在第 k 个触发采样，两个环形缓冲都是 2*AUDIO_BLK 帧、同一个 TIM2 触发，
+ * 因此第 k 帧对应的 DAC 输出是 dac_buf[(k-1) mod 2*AUDIO_BLK]。DAC 半缓冲中断比同半的 ADC 中断早几 µs，
+ * audio 任务又先处理 DAC 事件，处理 ADC 半缓冲 h 时 dac_hist[h] 和上一轮的 dac_hist[h^1] 都是对的。
+ * 前提是 ADC/DAC DMA 没有重启过（INFO 里 ovr=0、udr=0）。
+ */
+static uint16_t dac_hist[2][AUDIO_BLK];
 
 static TaskHandle_t audio_task_h;
 static volatile TaskHandle_t cap_waiter;
 static volatile uint32_t cap_need, cap_pos;
+static volatile bool cap_dac;
 
 /* 命令侧写请求，audio 任务在增益淡到 0 后切换 */
 static sig_cfg_t sig_req;
@@ -38,6 +50,21 @@ static volatile bool out_active;
 static level_t level_acc, level_pub;
 static uint32_t level_blocks;
 static audio_diag_t diag;
+static volatile uint32_t dac_isr_cyc;
+static volatile int anc_on, anc_prot;
+static float anc_y;
+static float baseline, err_rms_pub, y_rms_pub, e200, r200;
+static float err_ss, y_ss;
+static uint32_t err_n, y_n, sample_n, clamp_n, lag_cyc_max, cpu_cyc_max;
+static int baseline_init, over_windows;
+static anc_goertzel_t g_ref, g_err;
+
+static void dwt_enable(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
 
 static void level_reset(level_t *l)
 {
@@ -102,6 +129,8 @@ void audio_init(void)
 
     level_reset(&level_acc);
     level_reset(&level_pub);
+    dwt_enable();
+    anc_init(anc_state());
     for (int i = 0; i < DAC_LEN; i++)
         dac_buf[i] = DAC_MID;
 
@@ -221,7 +250,7 @@ static void fill_dac(uint16_t *dst)
     out_active = gain > 0.0f || (seq == sig_cur_seq && sig_cur.mode != SIG_OFF);
 }
 
-static void process_adc(const uint16_t *src)
+static void process_adc(const uint16_t *src, int half)
 {
     for (int i = 0; i < AUDIO_BLK; i++) {
         for (int c = 0; c < AUDIO_NCH; c++) {
@@ -235,11 +264,64 @@ static void process_adc(const uint16_t *src)
     }
     level_acc.n += AUDIO_BLK;
 
+    anc_t *st = anc_state();
+    for (int i = 0; i < AUDIO_BLK; i++) {
+        uint32_t t0 = DWT->CYCCNT;
+        int adapt = anc_on && !anc_prot && anc_shat_ready(st);
+        anc_sample_t o;
+        anc_step(st, src[i * AUDIO_NCH], src[i * AUDIO_NCH + 1], adapt, &o);
+        uint32_t dt = DWT->CYCCNT - t0;
+        diag.cpu_cyc = dt;
+        if (dt > cpu_cyc_max)
+            cpu_cyc_max = dt;
+        if (anc_goertzel_step(&g_ref, o.x_mv))
+            r200 = g_ref.rms;
+        if (anc_goertzel_step(&g_err, o.e_mv))
+            e200 = g_err.rms;
+        err_ss += o.e_mv * o.e_mv;
+        y_ss += o.y * o.y;
+        err_n++;
+        y_n++;
+        if (o.clamped && adapt)
+            clamp_n++;
+        anc_y = adapt ? o.y : 0.0f;
+        if (err_n >= (FS_HZ / 20)) { /* 50 ms */
+            float rms = sqrtf(err_ss / (float)err_n);
+            err_rms_pub = rms;
+            y_rms_pub = sqrtf(y_ss / (float)y_n);
+            err_ss = y_ss = 0.0f;
+            err_n = y_n = 0;
+            if (!anc_on) {
+                baseline = baseline_init ? baseline + 0.05f * (rms - baseline) : rms;
+                baseline_init = 1;
+                over_windows = 0;
+            } else if (!anc_prot && baseline_init && rms > 2.0f * baseline) {
+                if (++over_windows >= 4) {
+                    anc_prot = 1;
+                    anc_reset_w(st);
+                    anc_y = 0.0f;
+                }
+            } else {
+                over_windows = 0;
+            }
+        }
+        sample_n++;
+    }
+
     if (cap_pos < cap_need) {
         uint32_t k = cap_need - cap_pos;
         if (k > AUDIO_BLK)
             k = AUDIO_BLK;
-        memcpy(&cap_buf[cap_pos * AUDIO_NCH], src, k * AUDIO_NCH * sizeof(uint16_t));
+        if (cap_dac) {
+            uint16_t *dst = &cap_buf[cap_pos * (AUDIO_NCH + 1)];
+            for (uint32_t i = 0; i < k; i++, dst += AUDIO_NCH + 1) {
+                for (int c = 0; c < AUDIO_NCH; c++)
+                    dst[c] = src[i * AUDIO_NCH + c];
+                dst[AUDIO_NCH] = i ? dac_hist[half][i - 1] : dac_hist[half ^ 1][AUDIO_BLK - 1];
+            }
+        } else {
+            memcpy(&cap_buf[cap_pos * AUDIO_NCH], src, k * AUDIO_NCH * sizeof(uint16_t));
+        }
         cap_pos += k;
         if (cap_pos >= cap_need && cap_waiter)
             xTaskNotifyGive(cap_waiter);
@@ -255,16 +337,48 @@ static void process_adc(const uint16_t *src)
     }
 }
 
+/* 双缓冲只有两格。槽被 DMA 读走后，要再过一格才会被读第二次，所以期限是两个采样周期。
+ * 超过这个时间再写，DMA 已经把旧码装进 DHR，late/udr 都不会加。 */
+static void write_dac_half(uint16_t *dst, int half)
+{
+    uint32_t isr_cyc = dac_isr_cyc;
+    uint32_t dt = DWT->CYCCNT - isr_cyc;
+    if (isr_cyc != 0) {
+        if (dt > lag_cyc_max)
+            lag_cyc_max = dt;
+        if (dt > 2u * (SystemCoreClock / FS_HZ))
+            diag.slip++;
+    }
+    memcpy(dac_hist[half], dst, sizeof dac_hist[half]);
+    if (anc_on) {
+        for (int i = 0; i < AUDIO_BLK; i++) {
+            int32_t v = DAC_MID;
+            if (!anc_prot)
+                v += (int32_t)anc_y;
+            if (v < 0)
+                v = 0;
+            else if (v > 4095)
+                v = 4095;
+            dst[i] = (uint16_t)v;
+        }
+        out_active = !anc_prot && anc_y != 0.0f;
+    } else {
+        fill_dac(dst);
+    }
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
     for (;;) {
         uint32_t ev;
         xTaskNotifyWait(0, 0xFFFFFFFFu, &ev, portMAX_DELAY);
-        if (ev & EV_DAC_H0) fill_dac(&dac_buf[0]);
-        if (ev & EV_DAC_H1) fill_dac(&dac_buf[AUDIO_BLK]);
-        if (ev & EV_ADC_H0) process_adc(&adc_buf[0]);
-        if (ev & EV_ADC_H1) process_adc(&adc_buf[AUDIO_BLK * AUDIO_NCH]);
+        if (ev & EV_DAC_H0)
+            write_dac_half(&dac_buf[0], 0);
+        if (ev & EV_DAC_H1)
+            write_dac_half(&dac_buf[AUDIO_BLK], 1);
+        if (ev & EV_ADC_H0) process_adc(&adc_buf[0], 0);
+        if (ev & EV_ADC_H1) process_adc(&adc_buf[AUDIO_BLK * AUDIO_NCH], 1);
     }
 }
 
@@ -275,12 +389,15 @@ void audio_start_task(void)
     TIM_Cmd(TIM2, ENABLE);
 }
 
-void audio_set_signal(const sig_cfg_t *cfg)
+bool audio_set_signal(const sig_cfg_t *cfg)
 {
+    if (anc_on)
+        return false;
     taskENTER_CRITICAL();
     sig_req = *cfg;
     sig_req_seq++;
     taskEXIT_CRITICAL();
+    return true;
 }
 
 void audio_get_signal(sig_cfg_t *cfg)
@@ -305,25 +422,178 @@ void audio_get_level(level_t *out)
 void audio_get_diag(audio_diag_t *out)
 {
     taskENTER_CRITICAL();
+    diag.lag_us_max = (SystemCoreClock >= 1000000u) ? lag_cyc_max / (SystemCoreClock / 1000000u) : 0;
     *out = diag;
     taskEXIT_CRITICAL();
 }
 
-const uint16_t *audio_capture(uint32_t frames, uint32_t timeout_ms)
+static void force_silence(void)
 {
-    bool ok;
+    sig_cfg_t off = {0};
+    sig_req = off;
+    sig_cur = off;
+    sig_req_seq++;
+    sig_cur_seq = sig_req_seq;
+    gain = 0.0f;
+    out_active = false;
+}
 
-    if (frames == 0 || frames > CAP_MAX)
-        return NULL;
-    ulTaskNotifyTake(pdTRUE, 0);
+bool audio_anc_is_on(void)
+{
+    return anc_on;
+}
+
+bool audio_anc_on(const char **err)
+{
+    if (!anc_shat_ready(anc_state())) {
+        if (err) *err = "shat";
+        return false;
+    }
+    if (anc_prot) {
+        if (err) *err = "protected";
+        return false;
+    }
+    if (sample_n < (FS_HZ / 2)) {
+        if (err) *err = "settling";
+        return false;
+    }
     taskENTER_CRITICAL();
-    cap_waiter = xTaskGetCurrentTaskHandle();
+    force_silence();
+    anc_reset_w(anc_state());
+    clamp_n = 0;
+    over_windows = 0;
+    anc_y = 0.0f;
+    diag.slip = 0;
+    lag_cyc_max = 0;
+    cpu_cyc_max = 0;
+    anc_on = 1;
+    taskEXIT_CRITICAL();
+    return true;
+}
+
+void audio_anc_off(void)
+{
+    taskENTER_CRITICAL();
+    anc_on = 0;
+    anc_prot = 0;
+    anc_y = 0.0f;
+    over_windows = 0;
+    anc_reset_w(anc_state());
+    force_silence();
+    taskEXIT_CRITICAL();
+}
+
+void audio_anc_set_mu(float mu) { anc_set_mu(anc_state(), mu); }
+void audio_anc_set_gamma(float gamma) { anc_set_gamma(anc_state(), gamma); }
+void audio_anc_set_clamp(float clamp) { anc_set_clamp(anc_state(), clamp); }
+
+void audio_anc_stat(audio_anc_stat_t *out)
+{
+    anc_t *st = anc_state();
+    uint32_t period = SystemCoreClock / FS_HZ;
+    taskENTER_CRITICAL();
+    out->on = anc_on;
+    out->prot = anc_prot;
+    out->shat = anc_shat_ready(st);
+    out->settle = sample_n >= (FS_HZ / 2);
+    out->mu = anc_mu(st);
+    out->gamma = anc_gamma(st);
+    out->clamp = anc_clamp(st);
+    out->wnorm = anc_wnorm(st);
+    out->y_rms = y_rms_pub;
+    out->err_rms = err_rms_pub;
+    out->e200 = e200;
+    out->r200 = r200;
+    out->baseline = baseline;
+    out->clamp_n = clamp_n;
+    out->lag_us = (SystemCoreClock >= 1000000u) ? lag_cyc_max / (SystemCoreClock / 1000000u) : 0;
+    out->slip = diag.slip;
+    out->late = diag.late_blocks;
+    out->ovr = diag.adc_ovr;
+    out->udr = diag.dac_udr;
+    out->samples = sample_n;
+    out->cpu_pct = period ? 100.0f * (float)cpu_cyc_max / (float)period : 0.0f;
+    lag_cyc_max = 0;
+    cpu_cyc_max = 0;
+    taskEXIT_CRITICAL();
+}
+
+int audio_anc_shat_chunk(int index, const float *v, int n)
+{
+    if (anc_on)
+        return 0;
+    return anc_shat_chunk(anc_state(), index, v, n);
+}
+
+int audio_anc_shat_reset(void)
+{
+    if (anc_on)
+        return 0;
+    anc_shat_clear(anc_state());
+    return 1;
+}
+
+uint32_t audio_anc_shat_crc(void)
+{
+    return anc_shat_crc(anc_state());
+}
+
+int audio_xchk(const uint16_t *ref, float *xf, int n)
+{
+    if (anc_on || n <= 0 || n > 400)
+        return 0;
+    return anc_replay_xf(anc_state(), ref, xf, n);
+}
+
+int audio_capture_arm(uint32_t frames, bool with_dac)
+{
+    if (frames == 0 || frames > (with_dac ? CAP_MAX_DAC : CAP_MAX))
+        return 0;
+    taskENTER_CRITICAL();
+    if (cap_need != 0 && cap_pos < cap_need) {
+        taskEXIT_CRITICAL();
+        return 0;
+    }
+    cap_waiter = NULL;
+    cap_dac = with_dac;
     cap_pos = 0;
     cap_need = frames;
     taskEXIT_CRITICAL();
+    return 1;
+}
+
+const uint16_t *audio_capture_take(uint32_t *frames, bool *with_dac)
+{
+    taskENTER_CRITICAL();
+    if (cap_need == 0 || cap_pos < cap_need) {
+        taskEXIT_CRITICAL();
+        return NULL;
+    }
+    if (frames)
+        *frames = cap_need;
+    if (with_dac)
+        *with_dac = cap_dac;
+    cap_need = 0;
+    cap_waiter = NULL;
+    taskEXIT_CRITICAL();
+    return cap_buf;
+}
+
+const uint16_t *audio_capture(uint32_t frames, bool with_dac, uint32_t timeout_ms)
+{
+    bool ok;
+
+    ulTaskNotifyTake(pdTRUE, 0);
+    if (!audio_capture_arm(frames, with_dac))
+        return NULL;
+    taskENTER_CRITICAL();
+    cap_waiter = xTaskGetCurrentTaskHandle();
+    if (cap_pos >= cap_need)
+        xTaskNotifyGive(cap_waiter);
+    taskEXIT_CRITICAL();
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
     taskENTER_CRITICAL();
-    ok = cap_pos >= cap_need;
+    ok = cap_need != 0 && cap_pos >= cap_need;
     cap_need = 0;
     cap_waiter = NULL;
     taskEXIT_CRITICAL();
@@ -372,6 +642,8 @@ void DMA1_Stream5_IRQHandler(void)
         DMA_ClearITPendingBit(DMA1_Stream5, DMA_IT_TCIF5);
         ev |= EV_DAC_H1;
     }
+    if (ev)
+        dac_isr_cyc = DWT->CYCCNT;
     notify_audio(ev, &woken);
     portYIELD_FROM_ISR(woken);
 }

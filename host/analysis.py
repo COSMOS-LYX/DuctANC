@@ -6,6 +6,7 @@ from scipy import signal
 
 VREF_MV = 3300.0
 ADC_FS = 4095.0
+DAC_MID = 2048.0
 CH_NAMES = ("ref", "err")
 
 
@@ -51,6 +52,158 @@ def tone_level_db(f: np.ndarray, p: np.ndarray, f0: float, half_bw: float = 10.0
 def coherence(x_mv: np.ndarray, y_mv: np.ndarray, fs: float, nperseg: int = 1024):
     nperseg = min(nperseg, len(x_mv))
     return signal.coherence(x_mv, y_mv, fs=fs, nperseg=nperseg)
+
+
+def sine_fit(x, fs, f0) -> tuple[float, float]:
+    """最小二乘拟合 x ≈ a·cos(ωt) + b·sin(ωt) + c，返回 (rms 幅度, 相位 rad)，相位按 A·sin(ωt+φ) 定义。"""
+    t = np.arange(len(x)) / fs
+    w = 2 * np.pi * f0 * t
+    mat = np.column_stack([np.cos(w), np.sin(w), np.ones(len(x))])
+    (a, b, _c), *_ = np.linalg.lstsq(mat, x, rcond=None)
+    return float(np.hypot(a, b) / np.sqrt(2)), float(np.arctan2(a, b))
+
+
+def band_rms_mv(x, fs, lo=None, hi=None, order=4) -> float:
+    """Butterworth（sosfiltfilt）带通/低通/高通后的 rms。lo=None 表示低通 hi，hi=None 表示高通 lo。"""
+    if lo is not None and hi is not None:
+        sos = signal.butter(order, [lo, hi], "band", fs=fs, output="sos")
+    elif hi is not None:
+        sos = signal.butter(order, hi, "low", fs=fs, output="sos")
+    else:
+        sos = signal.butter(order, lo, "high", fs=fs, output="sos")
+    y = signal.sosfiltfilt(sos, x)
+    return float(np.sqrt(np.mean(y ** 2)))
+
+
+def tone_metrics(mv, fs, f0, search_hz=20.0) -> dict:
+    """单音分析（mv: N×2，ch0=ref, ch1=err）。
+
+    delay_samples 是 err 相对 ref 的相位差折算的样本数（正值 = err 晚到），
+    相位法只能确定到模一个周期，周期长度见 period_samples。
+    search_hz <= 0 时直接在 f0 上拟合（频率已知，如 DAC 输出或没有单音的对照段）。
+    """
+    f_est = float(f0)
+    if search_hz > 0:
+        ref = mv[:, 0] - mv[:, 0].mean()
+        n = 1 << 18
+        X = np.abs(np.fft.rfft(ref * np.hanning(len(ref)), n))
+        fr = np.fft.rfftfreq(n, 1 / fs)
+        m = (fr >= f0 - search_hz) & (fr <= f0 + search_hz)
+        f_est = float(fr[m][np.argmax(X[m])])
+    out = {"f": f_est}
+    for c, ch in enumerate(CH_NAMES[: mv.shape[1]]):
+        amp, phi = sine_fit(mv[:, c], fs, f_est)
+        d = {"amp_mv": amp, "phase": phi}
+        for k in (2, 3):
+            if k * f_est < fs / 2:
+                h, _ = sine_fit(mv[:, c], fs, k * f_est)
+                d[f"h{k}_db"] = float(20 * np.log10(h / amp + 1e-12))
+            else:
+                d[f"h{k}_db"] = float("nan")
+        out[ch] = d
+    dphi = np.pi - ((np.pi - (out["ref"]["phase"] - out["err"]["phase"])) % (2 * np.pi))
+    out["delay_samples"] = float(dphi * fs / (2 * np.pi * f_est))
+    out["period_samples"] = float(fs / f_est)
+    fc, cxy = coherence(mv[:, 0], mv[:, 1], fs)
+    out["coh"] = float(cxy[np.argmin(np.abs(fc - f_est))])
+    return out
+
+
+def block_sync_steps(x_mv, block=128, thresh_mv=120.0, tol=2) -> dict:
+    """检测与固件处理块同步的跳变（采集第 0 帧是块起点）。
+
+    fold：把 |diff| 按块内位置折叠平均，块边界 ±tol 处的最大值 / 其余位置的中位数。
+    干净信号约 1，块同步干扰明显 >2；对单音、削波等不同步的大跳变不敏感，判定只看它。
+    n / sync_frac / period：|diff| 峰值（height=thresh_mv）个数、落在块边界的比例、间隔中位数，仅供参考。
+    """
+    d = np.abs(np.diff(x_mv))
+    pos_all = (np.arange(len(d)) + 1) % block
+    fold = np.array([d[pos_all == k].mean() for k in range(block)])
+    edge = np.r_[0:tol + 1, block - tol:block]
+    rest = np.delete(fold, edge)
+    pk, _ = signal.find_peaks(d, height=thresh_mv, distance=block // 2)
+    pos = (pk + 1) % block
+    sync = (pos <= tol) | (pos >= block - tol)
+    gaps = np.diff(pk)
+    return {"n": int(len(pk)),
+            "sync_frac": float(np.mean(sync)) if len(pk) else 0.0,
+            "period": float(np.median(gaps)) if len(gaps) else 0,
+            "fold": float(fold[edge].max() / (np.median(rest) + 1e-12))}
+
+
+def is_block_sync(r) -> bool:
+    return r["fold"] >= 2.0
+
+
+def fir_ls(u: np.ndarray, y: np.ndarray, n_taps: int) -> np.ndarray:
+    """因果 FIR 的最小二乘。h[k] 使 y[n] ≈ Σ h[k] u[n−k]，k = 0 是同一拍。
+
+    拟合前各自去直流。只使用窗口完整落在记录内的样本，记录开头的 n_taps−1 点不进方程。
+    """
+    u = np.ascontiguousarray(u, dtype=np.float64)
+    y = np.ascontiguousarray(y, dtype=np.float64)
+    if u.ndim != 1 or u.shape != y.shape:
+        raise ValueError("u and y must be 1-D and the same length")
+    if not 1 <= n_taps <= len(u):
+        raise ValueError("n_taps out of range")
+    u = u - u.mean()
+    y = y - y.mean()
+    X = np.lib.stride_tricks.sliding_window_view(u, n_taps)[:, ::-1]
+    h, *_ = np.linalg.lstsq(X, y[n_taps - 1:], rcond=None)
+    return h
+
+
+def xcorr_ir(x: np.ndarray, y: np.ndarray, nlag: int = 200) -> np.ndarray:
+    """白噪声激励下的冲激响应粗估：h[k] = Σ x[n]·y[n+k] / Σ x²，k = 0..nlag-1（y 相对 x 晚 k 个样本）。"""
+    x = x - x.mean()
+    y = y - y.mean()
+    n = 1 << int(np.ceil(np.log2(2 * len(x))))
+    r = np.fft.irfft(np.conj(np.fft.rfft(x, n)) * np.fft.rfft(y, n), n)[:nlag]
+    return r / (np.dot(x, x) + 1e-12)
+
+
+def dac_check(dac: np.ndarray, mv: np.ndarray, fs: float, nlag: int = 200) -> dict:
+    """DAC 通道（码值）→ 两只麦（mV）：冲激响应粗估、到达时刻、相干。
+
+    h 的单位是 mV / DAC 码；只有激励接近白噪声时 h 才接近真实冲激响应，单音只能看相干。
+    onset：|h| 第一次超过最大值 30% 的样本，即声音到达时刻（管道共振会让 |h| 最大值落在后面的振荡里，
+    peak_lag 不代表延迟）。coh_200：200 Hz 处相干；100–400 Hz 平均会被频响凹陷拉低。
+    """
+    u = dac.astype(np.float64) - DAC_MID
+    out = {"dac_rms": float(u.std()), "dac_pp": int(dac.max()) - int(dac.min())}
+    for c, ch in enumerate(CH_NAMES[: mv.shape[1]]):
+        h = xcorr_ir(u, mv[:, c], nlag)
+        f, cxy = coherence(u, mv[:, c], fs)
+        m = (f >= 100) & (f <= 400)
+        a = np.abs(h)
+        out[ch] = {"ir": h, "peak_lag": int(np.argmax(a)), "onset": int(np.argmax(a > 0.3 * a.max())),
+                   "f": f, "coh": cxy, "coh_100_400": float(np.mean(cxy[m])),
+                   "coh_200": float(cxy[np.argmin(np.abs(f - 200))])}
+    return out
+
+
+def plot_dac_check(chk: dict, fs: float, path, title: str = "") -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(2, 1, figsize=(9, 6.5))
+    for ch in CH_NAMES:
+        if ch in chk:
+            r = chk[ch]
+            ax[0].plot(r["ir"], lw=0.8, label=f"{ch} (onset {r['onset']}, max at {r['peak_lag']})")
+            ax[0].axvline(r["onset"], lw=0.6, ls="--", color=ax[0].lines[-1].get_color())
+            ax[1].plot(r["f"], r["coh"], lw=0.8,
+                       label=f"{ch} (200 Hz {r['coh_200']:.2f}, 100-400 Hz mean {r['coh_100_400']:.2f})")
+    ax[0].set(xlabel="lag / samples", ylabel="h / mV per DAC code", title=title)
+    ax[1].set(xlabel="f / Hz", ylabel="γ² DAC-mic", xlim=(0, fs / 2), ylim=(0, 1.05))
+    ax[1].axvspan(100, 400, color="orange", alpha=0.15)
+    for a in ax:
+        a.grid(alpha=0.3)
+        a.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 
 def crosstalk(codes: np.ndarray) -> dict:
