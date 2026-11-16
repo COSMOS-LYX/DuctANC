@@ -18,22 +18,47 @@ import anc_coeff as ac
 import hwtest
 
 
-def upload(dev: hwtest.Device, coeff: np.ndarray) -> str:
-    dev.cmd("SHAT RST", timeout=3)
+def _upload_bank(dev: hwtest.Device, cmd: str, coeff: np.ndarray) -> str:
+    """SHAT / FREF 共用：RST，然后 48 块 8×float32，再 CRC。"""
+    dev.cmd(f"{cmd} RST", timeout=3)
     raw = np.ascontiguousarray(coeff, dtype="<f4")
-    for index in range(0, ac.N_SHAT, 8):
-        blob = raw[index:index + 8].tobytes().hex()
-        dev.cmd(f"SHAT {index} {blob}", timeout=3)
-    crc = dev.cmd("SHAT CRC", timeout=3)
+    for index, blob in ac.coef_chunks(raw):
+        dev.cmd(f"{cmd} {index} {blob}", timeout=3)
+    crc = dev.cmd(f"{cmd} CRC", timeout=3)
     expect = f"{ac.crc32_f32(raw):08X}"
     if f"crc={expect}" not in crc or "ready=1" not in crc:
-        raise hwtest.DeviceError(f"shat crc {crc}, expect {expect}")
+        raise hwtest.DeviceError(f"{cmd} crc {crc}, expect {expect}")
     return expect
+
+
+def upload(dev: hwtest.Device, coeff: np.ndarray, fref: np.ndarray | None = None, *,
+           require_fref: bool = False) -> dict:
+    """下发 Ŝ_eff。fref 有值时接着下发原始 h_ref（不卷高通）。
+
+    固件还没有 FREF（未烧录本改动）时，默认记下并继续，Ŝ 已经在片上。
+    require_fref=True 时旧固件的 unknown command 也当作失败。
+    返回 {"shat", "fref", "fref_skipped"}。fref 校验和只在写成功时有。
+    """
+    shat = _upload_bank(dev, "SHAT", coeff)
+    out = {"shat": shat, "fref": None, "fref_skipped": False}
+    if fref is None:
+        return out
+    try:
+        out["fref"] = _upload_bank(dev, "FREF", fref)
+    except hwtest.DeviceError as e:
+        if require_fref or "unknown command" not in str(e):
+            raise
+        out["fref_skipped"] = True
+        print("FREF 未写入：当前固件没有这条命令。Ŝ 已下发。本改动不要求先烧录。")
+    return out
 
 
 def do_xchk(dev: hwtest.Device, d: Path) -> dict:
     coeff, info = ac.shat_eff()
-    crc = upload(dev, coeff)
+    href = ac.load_h_ref()
+    sent = upload(dev, coeff, None if href is None else ac.fref_f32(href))
+    crc = sent["shat"]
+    info = {**info, "fref_crc": sent["fref"] or "", "fref_skipped": int(sent["fref_skipped"])}
     z = np.load(ac.PRIMARY)
     codes = z["codes"][:400, 0]
     host = ac.replay_xf(codes, coeff)
@@ -53,7 +78,8 @@ def do_xchk(dev: hwtest.Device, d: Path) -> dict:
 
 def do_bench(dev: hwtest.Device, d: Path) -> dict:
     coeff, info = ac.shat_eff()
-    upload(dev, coeff)
+    href = ac.load_h_ref()
+    upload(dev, coeff, None if href is None else ac.fref_f32(href))
     dev.cmd("CLAMP 0")
     dev.cmd("MU 0.002")
     dev.cmd("GAMMA 0")

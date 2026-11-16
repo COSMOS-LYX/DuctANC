@@ -1,8 +1,12 @@
 """P3：用实测 Ŝ 和录音，在电脑上跑 FxNLMS。不连板子。
 
 用法（在 host/ 下）：
-    python sim_p3.py          # 全部实验，约几十秒
-    python sim_p3.py --quick  # 只跑 4 s 基线，用来确认符号和合成
+    python sim_p3.py          # 全部实验。有 h_ref 时植物回流用 384 阶 FIR
+    python sim_p3.py --quick  # 只跑 4 s 无回流基线，用来确认符号和合成
+
+主参数固定 N=16，μ=0.01，γ=0。宽带 FIR-F 的数字不是旧窄带 fb200
+（增益 × 分数延迟）规则下的官方 P3 合格判定；窄带模型仍单独留一行对照。
+最新的 *_p2shat/shat.npz 和 *_fb200 按目录名选用，不把某一次记录写死成唯一路径。
 """
 from __future__ import annotations
 
@@ -33,16 +37,72 @@ DAC_LIM = 2047.0          # 相对中点 2048 的 12 位上限
 PLANT_LAG = 1.0           # 逐点固件：本拍 DAC 要到下一拍才进麦
 EPS = 1.0
 RECORD = Path(__file__).resolve().parent.parent / "实验记录"
-SHAT = RECORD / "20261110_175018_p2shat" / "shat.npz"
+# 仓库里现成的一套。目录里若有更新的 *_p2shat / *_fb200，用更新的那套。
+_SHAT_FALLBACK = RECORD / "20261110_175018_p2shat" / "shat.npz"
+_FB_FALLBACK = RECORD / "20261110_173557_fb200"
 PRIMARY = RECORD / "20261110_154011_p0test" / "4_stand.npz"
 TOUCH = RECORD / "20261110_154011_p0test" / "5_touch.npz"
 QUIET = RECORD / "20261110_154011_p0test" / "0_quiet.npz"
-QUIET_FB = RECORD / "20261110_173557_fb200" / "0_quiet.npz"
 SILENT = RECORD / "20261110_154011_p0test" / "6_silent.npz"
-FB = RECORD / "20261110_173557_fb200" / "2_cancel_level.npz"
-FB_PROBE = RECORD / "20261110_173557_fb200" / "1_probe.npz"
 # 不在 shat.npz 那三段里，单独辨识，给算法一只对不上的 Ŝ
 SHAT_ALT = RECORD / "20261110_162814_sid_a" / "sid_a.npz"
+N0, MU0, G0 = 16, 0.01, 0.0
+FB_OFF, FB_NARROW, FB_FIR = 0, 1, 2
+
+
+def _newest(pattern: str) -> Path | None:
+    hits = sorted(RECORD.glob(pattern))
+    return hits[-1] if hits else None
+
+
+def shat_path() -> Path:
+    return _newest("*_p2shat/shat.npz") or _SHAT_FALLBACK
+
+
+def fb_dir() -> Path:
+    hits = sorted(p for p in RECORD.glob("*_fb200") if p.is_dir())
+    return hits[-1] if hits else _FB_FALLBACK
+
+
+def load_plant(path: Path | None = None):
+    """返回 (h_err, h_ref 或 None)。没有 h_ref 键就保持旧文件可读。"""
+    z = np.load(path or shat_path())
+    try:
+        h_err = np.asarray(z["h_err"], np.float64)
+        h_ref = np.asarray(z["h_ref"], np.float64) if "h_ref" in z.files else None
+    finally:
+        z.close()
+    if h_ref is not None and h_ref.shape != h_err.shape:
+        raise ValueError(f"h_ref {h_ref.shape} 与 h_err {h_err.shape} 长度不同")
+    return h_err, h_ref
+
+
+def fir_response(h, hz: float = F0, nfft: int = 16384):
+    """同一拍 FIR 在 hz 上的幅度、相位延迟（样本）、相位（度）。不含仿真多加的 1 拍。"""
+    f = np.fft.rfftfreq(nfft, 1.0 / FS)
+    H = np.fft.rfft(np.asarray(h, np.float64), nfft)
+    k = int(np.argmin(np.abs(f - hz)))
+    mag = float(np.abs(H[k]))
+    deg = float(np.degrees(np.angle(H[k])))
+    lag = float(-np.angle(H[k]) * FS / (2 * np.pi * f[k])) if f[k] else 0.0
+    return mag, lag, deg
+
+
+def fir_plant(y, h, plant_lag: int = 1) -> np.ndarray:
+    """辨识 FIR（同一拍）再加 write-after-read 的 plant_lag 个样本。
+
+    h[k] 乘的是 k+plant_lag 拍之前的 y。plant_lag=1 与 simulate 里先读麦、后写 y 一致。
+    """
+    y = np.asarray(y, np.float64)
+    h = np.asarray(h, np.float64)
+    out = np.zeros(len(y), np.float64)
+    for k, hk in enumerate(h):
+        if hk == 0.0:
+            continue
+        d = int(k + plant_lag)
+        if d < len(y):
+            out[d:] += hk * y[:len(y) - d]
+    return out
 
 
 def load_mv(path: Path):
@@ -66,14 +126,15 @@ def band_rms(x, fs, lo, hi):
 def inventory():
     """盘点。返回 (markdown 行, 给合成用的测量)。"""
     rows = []
+    fb = fb_dir()
     specs = [
         ("手机支架 200 Hz，喇叭未出声", PRIMARY, False),
         ("手机贴管", TOUCH, False),
         ("外部声源停，0_quiet", QUIET, False),
         ("播放静音文件", SILENT, False),
-        ("fb200 静音", QUIET_FB, False),
-        ("fb200 抵消档，喇叭 200 Hz", FB, True),
-        ("fb200 探针 amp 0.01", FB_PROBE, True),
+        ("fb200 静音", fb / "0_quiet.npz", False),
+        ("fb200 抵消档，喇叭 200 Hz", fb / "2_cancel_level.npz", True),
+        ("fb200 探针 amp 0.01", fb / "1_probe.npz", True),
     ]
     for title, path, _has in specs:
         mv, fs, codes = load_mv(path)
@@ -217,15 +278,31 @@ def _biquad(x, b, a, z):
 
 
 @njit(cache=True)
-def simulate(x0, d, S, Sh, w_len, f_gain, f_lag, b_hp, a_hp,
+def _fir_at(buf, head, h, nbuf):
+    """h[0] 乘 buf[head]。head 指向已经写好的上一拍 y，所以自带 1 个样本的植物延迟。"""
+    acc = 0.0
+    n = h.shape[0]
+    for k in range(n):
+        acc += h[k] * buf[(head - k + nbuf) % nbuf]
+    return acc
+
+
+@njit(cache=True)
+def simulate(x0, d, S, Sh, F, w_len, f_gain, f_lag, b_hp, a_hp,
              mu, gamma, eps, phase_deg,
-             do_fb, do_hp, do_align, do_quant,
-             baseline_rms, prot_ratio, prot_windows):
+             fb_mode, do_hp, do_align, do_quant,
+             baseline_rms, prot_ratio, prot_windows, w_init):
+    """fb_mode: 0 无回流，1 窄带增益×分数延迟（f_lag 已含 PLANT_LAG），2 宽带 FIR。
+
+    FIR 与 S 同一条缓冲：辨识系数是同一拍的，多出来的 1 拍就是先读麦后写 y。
+    """
     n = x0.shape[0]
     Ls = S.shape[0]
     Lh = Sh.shape[0]
+    Lf = F.shape[0]
     N = w_len
-    ny = Ls + 8
+    nplant = Ls if Ls >= Lf else Lf
+    ny = nplant + 8
     nx = Lh + 2
     nf = N + 16
     yb = np.zeros(ny)
@@ -235,6 +312,8 @@ def simulate(x0, d, S, Sh, w_len, f_gain, f_lag, b_hp, a_hp,
     xh = 0
     fh = 0
     w = np.zeros(N)
+    for k in range(N):
+        w[k] = w_init[k]
     zx = np.zeros(2)
     ze = np.zeros(2)
     zf = np.zeros(2)
@@ -252,12 +331,12 @@ def simulate(x0, d, S, Sh, w_len, f_gain, f_lag, b_hp, a_hp,
     inv_n = 0
     xf2 = 0.0
     for i in range(n):
-        ac = 0.0
-        for k in range(Ls):
-            ac += S[k] * yb[(yh - k + ny) % ny]
+        ac = _fir_at(yb, yh, S, ny)
         fb_s = 0.0
-        if do_fb == 1:
+        if fb_mode == 1:
             fb_s = f_gain * _frac(yb, yh, f_lag, ny)
+        elif fb_mode == 2:
+            fb_s = _fir_at(yb, yh, F, ny)
         xr = x0[i] + fb_s
         er = d[i] + ac
         if do_hp == 1:
@@ -383,9 +462,32 @@ def conv_time(t, db):
     return float(t[int(good[0])]), steady
 
 
+def _fb_mode(fb) -> int:
+    if fb is True or fb == "narrow" or fb == FB_NARROW:
+        return FB_NARROW
+    if fb == "fir" or fb == FB_FIR:
+        return FB_FIR
+    return FB_OFF
+
+
 def run_case(x0, d, S, Sh, f_gain, f_lag, *, N, mu, gamma, hp, fb, align, quant,
-             phase=0.0, prot_ratio=0.0, shock=None):
+             phase=0.0, prot_ratio=0.0, shock=None, F=None, w_init=None):
     x = x0 if shock is None else x0 + shock
+    mode = _fb_mode(fb)
+    if mode == FB_FIR:
+        if F is None:
+            raise ValueError("宽带 FIR-F 需要 h_ref")
+        Fb = np.ascontiguousarray(F, np.float64)
+        # 1 拍植物延迟在环形缓冲里，不要再把 PLANT_LAG 加到分数延迟上。
+        lag = 0.0
+    else:
+        Fb = np.zeros(1, np.float64)
+        lag = float(f_lag + PLANT_LAG) if mode == FB_NARROW else 0.0
+    w0 = np.zeros(int(N), np.float64)
+    if w_init is not None:
+        src = np.asarray(w_init, np.float64).ravel()
+        ncopy = min(len(src), int(N))
+        w0[:ncopy] = src[:ncopy]
     b, a = hp_coeff(hp if (hp and (True)) else 0)
     # 高通阶数只在 hp>0 时生效；对齐与否另走 do_align
     e_off = off_error(d, hp)
@@ -396,10 +498,11 @@ def run_case(x0, d, S, Sh, f_gain, f_lag, *, N, mu, gamma, hp, fb, align, quant,
         np.ascontiguousarray(d, np.float64),
         np.ascontiguousarray(S, np.float64),
         np.ascontiguousarray(Sh, np.float64),
-        int(N), float(f_gain), float(f_lag + PLANT_LAG), b, a,
+        Fb,
+        int(N), float(f_gain), lag, b, a,
         float(mu), float(gamma), float(EPS), float(phase),
-        1 if fb else 0, 1 if hp else 0, 1 if align else 0, 1 if quant else 0,
-        base, float(prot_ratio), 4,
+        mode, 1 if hp else 0, 1 if align else 0, 1 if quant else 0,
+        base, float(prot_ratio), 4, w0,
     )
     amp, _ = an.sine_fit(e[-4 * FS:], FS, F0)
     db = float(20 * np.log10(amp / ref_amp + 1e-18))
@@ -533,87 +636,106 @@ def main(argv=None):
     print("inventory + synthesize", seconds, "s")
     rows_inv = inventory()
     x0, d, check, shock = synthesize(seconds, rng)
-    S = np.load(SHAT)["h_err"].astype(np.float64)
+    plant_path = shat_path()
+    fb = fb_dir()
+    S, h_ref = load_plant(plant_path)
+    use_fir = h_ref is not None
     print("identify alternate S, this takes a few seconds")
     Sh = identify_alt()
     mismatch = 20 * np.log10(np.linalg.norm(Sh - S) / np.linalg.norm(S))
-    f_gain, f_lag, f_deg = feedback_gain(FB)
-    g2, lag2, deg2 = feedback_gain(FB_PROBE)
-    print(f"F gain {f_gain:.4f} lag {f_lag:.3f} ({f_deg:.1f} deg); probe {g2:.4f} {lag2:.3f}")
+    f_gain, f_lag, f_deg = feedback_gain(fb / "2_cancel_level.npz")
+    g2, lag2, deg2 = feedback_gain(fb / "1_probe.npz")
+    s10, _, _ = fir_response(S, 10.0)
+    if use_fir:
+        fir_mag, fir_lag, fir_deg = fir_response(h_ref)
+        fir_mag10, _, _ = fir_response(h_ref, 10.0)
+        print(f"FIR F(200) {fir_mag:.4f} mV/code lag {fir_lag:.3f} ({fir_deg:.1f} deg); "
+              f"|F|(10 Hz) {fir_mag10:.4f}")
+    else:
+        fir_mag = fir_lag = fir_deg = fir_mag10 = float("nan")
+        print("shat.npz 没有 h_ref，植物回流退回窄带 fb200")
+    print(f"narrow F gain {f_gain:.4f} lag {f_lag:.3f} ({f_deg:.1f} deg); probe {g2:.4f} {lag2:.3f}")
     print(f"S mismatch vs held-out {mismatch:.1f} dB")
     print("synth", {k: check[k] for k in ("ref_mv", "err_mv", "delay", "lf_ref", "lf_err")})
 
     if args.quick:
         r = run_case(x0, d, S, Sh, f_gain, f_lag, N=8, mu=0.01, gamma=0.0,
-                     hp=0, fb=False, align=False, quant=False)
+                     hp=0, fb="off", align=False, quant=False)
         print("quick baseline", fmt_db(r), fmt_tc(r["tc"]), "peak", r["peak"])
         return
 
-    # 固定一组中等参数做逐项对比，不在这里为了过线改 μ
-    N0, MU0, G0 = 16, 0.01, 0.0
+    # 主参数不随扫描改。有 h_ref 时植物是宽带 FIR，扫描用一阶对齐+量化（这组在 FIR 植物上稳过）。
+    fb_on = "fir" if use_fir else "narrow"
+    label = "FIR回流" if use_fir else "回流"
+    sw_hp = 1 if use_fir else 2
+    headline_name = f"+{label} +一阶对齐 +量化" if use_fir else f"+{label} +二阶对齐 +量化"
+    plant_note = "宽带 FIR-F（h_ref）" if use_fir else "窄带 fb200"
+
+    def case(**kw):
+        kw.setdefault("F", h_ref)
+        return run_case(x0, d, S, Sh, f_gain, f_lag, **kw)
+
     factors = [
-        ("基线 浮点", dict(hp=0, fb=False, align=False, quant=False)),
-        ("+回流", dict(hp=0, fb=True, align=False, quant=False)),
-        ("+回流 +一阶高通失配", dict(hp=1, fb=True, align=False, quant=False)),
-        ("+回流 +二阶高通失配", dict(hp=2, fb=True, align=False, quant=False)),
-        ("+回流 +一阶高通对齐", dict(hp=1, fb=True, align=True, quant=False)),
-        ("+回流 +二阶高通对齐", dict(hp=2, fb=True, align=True, quant=False)),
-        ("+回流 +一阶对齐 +量化", dict(hp=1, fb=True, align=True, quant=True)),
-        ("+回流 +二阶对齐 +量化", dict(hp=2, fb=True, align=True, quant=True)),
+        ("基线 浮点", dict(hp=0, fb="off", align=False, quant=False)),
+        (f"+{label}", dict(hp=0, fb=fb_on, align=False, quant=False)),
+        (f"+{label} +一阶高通失配", dict(hp=1, fb=fb_on, align=False, quant=False)),
+        (f"+{label} +二阶高通失配", dict(hp=2, fb=fb_on, align=False, quant=False)),
+        (f"+{label} +一阶高通对齐", dict(hp=1, fb=fb_on, align=True, quant=False)),
+        (f"+{label} +二阶高通对齐", dict(hp=2, fb=fb_on, align=True, quant=False)),
+        (f"+{label} +一阶对齐 +量化", dict(hp=1, fb=fb_on, align=True, quant=True)),
+        (f"+{label} +二阶对齐 +量化", dict(hp=2, fb=fb_on, align=True, quant=True)),
     ]
+    if use_fir:
+        factors.append((
+            "对照 窄带fb200 +一阶对齐 +量化",
+            dict(hp=1, fb="narrow", align=True, quant=True),
+        ))
     factor_rows = []
-    print("factors")
+    print("factors", plant_note)
     for name, kw in factors:
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N0, mu=MU0, gamma=G0, phase=0.0, **kw)
+        r = case(N=N0, mu=MU0, gamma=G0, phase=0.0, **kw)
         r["name"] = name
         factor_rows.append(r)
         print(f"  {name}: {fmt_db(r)}  short={r['db_short']}  {fmt_tc(r['tc'])}  y_rms={r['y_rms']:.2f}")
+    head = next(r for r in factor_rows if r["name"] == headline_name)
 
-    print("N sweep")
+    print("N sweep", plant_note, "hp", sw_hp)
     n_rows = []
     for N in (4, 8, 16, 32):
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N, mu=MU0, gamma=G0,
-                     hp=2, fb=True, align=True, quant=True)
+        r = case(N=N, mu=MU0, gamma=G0, hp=sw_hp, fb=fb_on, align=True, quant=True)
         r["N"] = N
         n_rows.append(r)
         print(f"  N={N}: {fmt_db(r)} short={r['db_short']} {fmt_tc(r['tc'])}")
 
-    # 抽头取仍能降到 −20 dB 里、稳态最深的。μ 扫描在这只 N 上做。
     usable_N = [r for r in n_rows if (not r["diverged"]) and r["db"] <= -20]
-    N_star = min(usable_N, key=lambda r: r["db"])["N"] if usable_N else 16
+    deep_N = min(usable_N, key=lambda r: r["db"])["N"] if usable_N else None
 
     mus = [0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.08, 0.1, 0.2, 0.5, 1.0]
-    print("mu sweep N", N_star)
+    print("mu sweep N", N0)
     mu_rows = []
     for mu in mus:
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N_star, mu=mu, gamma=0.0,
-                     hp=2, fb=True, align=True, quant=True)
+        r = case(N=N0, mu=mu, gamma=0.0, hp=sw_hp, fb=fb_on, align=True, quant=True)
         r["mu"] = mu
         mu_rows.append(r)
         print(f"  mu={mu}: {fmt_db(r)} short={r['db_short']} {fmt_tc(r['tc'])} rail={r['rail']:.3f}")
     picked, ub, pick_note = pick_mu(mu_rows)
-    mu_star = picked["mu"] if picked else MU0
+    mu_scan = picked["mu"] if picked else None
 
     print("gamma sweep")
     gammas = [0.0, 1e-6, 1e-5, 1e-4, 1e-3]
     g_rows = []
     for g in gammas:
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N_star, mu=mu_star, gamma=g,
-                     hp=2, fb=True, align=True, quant=True)
+        r = case(N=N0, mu=MU0, gamma=g, hp=sw_hp, fb=fb_on, align=True, quant=True)
         r["gamma"] = g
         g_rows.append(r)
         print(f"  gamma={g}: {fmt_db(r)} {fmt_tc(r['tc'])}")
-    g0 = g_rows[0]["db"]
-    g_star = 0.0
 
     print("phase sweep")
     phases = [0, 15, 30, 45, 60, 75, 90, -15, -30, -45, -60, -75, -90]
     ph_rows = []
     for ph in phases:
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N_star, mu=mu_star, gamma=g_star,
-                     hp=2, fb=True, align=True, quant=True, phase=ph)
+        r = case(N=N0, mu=MU0, gamma=G0, hp=sw_hp, fb=fb_on, align=True, quant=True, phase=ph)
         r["phase"] = ph
-        # 相位扫描不保留整段波形
         r.pop("e")
         r.pop("y")
         ph_rows.append(r)
@@ -622,42 +744,42 @@ def main(argv=None):
     print("shock")
     shock_rows = []
     for hp, align in ((0, False), (1, True), (2, True)):
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N_star, mu=mu_star, gamma=g_star,
-                     hp=hp, fb=True, align=align, quant=True, shock=shock)
+        r = case(N=N0, mu=MU0, gamma=G0, hp=hp, fb=fb_on, align=align, quant=True, shock=shock)
         r["hp"] = hp
         shock_rows.append(r)
         print(f"  hp={hp}: {fmt_db(r)} inv={r['inv']:.3e} y_rms={r['y_rms']:.2f}")
 
     print("headline + protect")
-    head = run_case(x0, d, S, Sh, f_gain, f_lag, N=N_star, mu=mu_star, gamma=g_star,
-                    hp=2, fb=True, align=True, quant=True)
-    e_off = off_error(d, 2)
+    e_off = off_error(d, sw_hp)
     f_spec, poff, pon, spec_rows, band_off, band_on = spectrum_pair(head["e"], e_off)
 
     base_open = float(np.sqrt(np.mean(e_off ** 2)))
     prot_rows = []
     for name, kw in (
-        ("推荐参数，保护开着", dict(phase=0.0, mu=mu_star)),
-        ("相位 180°", dict(phase=180.0, mu=mu_star)),
-        ("μ×10", dict(phase=0.0, mu=mu_star * 10)),
+        ("主参数，保护开着", dict(phase=0.0, mu=MU0)),
+        ("相位 180°", dict(phase=180.0, mu=MU0)),
+        ("μ×10", dict(phase=0.0, mu=MU0 * 10)),
     ):
-        r = run_case(x0, d, S, Sh, f_gain, f_lag, N=N_star, gamma=g_star,
-                     hp=2, fb=True, align=True, quant=True, prot_ratio=2.0, **kw)
+        r = case(N=N0, gamma=G0, hp=sw_hp, fb=fb_on, align=True, quant=True,
+                 prot_ratio=2.0, **kw)
         r["name"] = name
         prot_rows.append(r)
         print(f"  {name}: mute={r['mute']} blew={r['blew']} db={r['db']:+.1f}")
 
-    # 图：基线、只加回流、二阶失配、二阶对齐+量化
-    want = ["基线 浮点", "+回流", "+回流 +二阶高通失配", "+回流 +二阶对齐 +量化"]
+    if use_fir:
+        want = ["基线 浮点", f"+{label}", headline_name, "对照 窄带fb200 +一阶对齐 +量化"]
+    else:
+        want = ["基线 浮点", f"+{label}", f"+{label} +二阶高通失配", headline_name]
     curves = [(r["name"], r) for r in factor_rows if r["name"] in want]
-    curves.append((f"推荐 N={N_star} μ={mu_star:g} γ={g_star:g}", head))
 
     out = RECORD / f"{dt.datetime.now():%Y%m%d_%H%M%S}_p3sim"
     out.mkdir(parents=True)
     write_plots(out, curves, (f_spec, poff, pon), mu_rows)
     np.savez(out / "summary.npz",
              mismatch_db=mismatch, f_gain=f_gain, f_lag=f_lag,
-             N=N_star, mu=mu_star, gamma=g_star)
+             fir_mag=fir_mag, fir_lag=fir_lag, fir_deg=fir_deg,
+             plant=np.array(plant_note),
+             N=N0, mu=MU0, gamma=G0)
 
     def fmt_short(r):
         v = r["db_short"]
@@ -694,24 +816,27 @@ def main(argv=None):
     ref_m, ref_s = check["ref_mv"]
     err_m, err_s = check["err_mv"]
     dly_m, dly_s = check["delay"]
-    pass_tone = head["db"] <= -20 and not head["diverged"]
-    pass_short = head["db_short"] is not None and head["db_short"] <= -20
-    pass_time = head["tc"] is not None and head["tc"] <= 1.0
-    pass_db = pass_tone and pass_short and pass_time
-    if pass_db:
-        verdict = "达到"
+    sw_name = "一阶对齐 + 量化" if use_fir else "二阶对齐 + 量化"
+    deep_txt = "没有" if deep_N is None else str(deep_N)
+    scan_txt = "没有" if mu_scan is None else f"{mu_scan:g}"
+    if use_fir:
+        fir_blurb = (
+            f"宽带 `h_ref` 来自 `{plant_path.parent.name}`，200 Hz 为 {fir_mag:.3f} mV/码、"
+            f"{fir_deg:+.1f}°、相位延迟 {fir_lag:.2f} 样本（不含仿真多加的 1 拍）。"
+            f"10 Hz 处 |h_ref| = {fir_mag10:.3f} mV/码，|S| = {s10:.3f} mV/码。"
+            "控制器没有做 F 中和，这条 FIR 只放在植物里。"
+        )
+        claim = (
+            "上面的主结果是宽带 FIR-F 植物上的数字。本报告不按旧窄带 F"
+            "（fb200 的增益 × 分数延迟）规则宣布官方 P3 合格或不合格。"
+            "窄带同一控制器只在「对照 窄带fb200」那一行，供比较。"
+        )
     else:
-        bits = []
-        if not pass_tone:
-            bits.append(f"4 s 正弦拟合只有 {head['db']:+.1f} dB")
-        if not pass_short:
-            bits.append(f"0.25 s 窗中位数只有 {fmt_short(head)} dB")
-        if not pass_time:
-            bits.append(f"收敛 {fmt_tc(head['tc'])}，长于 1 s")
-        verdict = "没有达到：" + "；".join(bits)
-    text = f"""# P3 离线 FxNLMS 2026-11-10
+        fir_blurb = "这份 `shat.npz` 没有 `h_ref`，回流退回窄带 fb200。"
+        claim = "这份记录没有宽带 FIR，主结果用的是窄带 fb200 植物。"
+    text = f"""# P3 离线 FxNLMS {dt.datetime.now():%Y-%m-%d}
 
-只在电脑上跑。真实次级路径是 `shat.npz` 的 `h_err`（384 阶）。算法里的 Ŝ 是 `20261110_162814_sid_a` 单独最小二乘的 384 阶，和真路径的冲激响应差 {mismatch:.1f} dB。这段没有进 `shat.npz`。
+只在电脑上跑。在 `host/` 下执行 `python sim_p3.py`；`--quick` 只跑 4 s 无回流基线。真实次级路径是 `{plant_path.parent.name}/shat.npz` 的 `h_err`（{len(S)} 阶）。算法里的 Ŝ 是 `20261110_162814_sid_a` 单独最小二乘的 384 阶，和真路径的冲激响应差 {mismatch:.1f} dB。这段没有进 `shat.npz`。这一轮植物回流是 {plant_note}。
 
 ## 盘点
 
@@ -735,13 +860,13 @@ def main(argv=None):
 
 贴管段 6–16 Hz 的参考麦按 Welch 是 {band_rms(load_mv(TOUCH)[0][:,0], FS, 6, 16):.1f} mV。讨论记录里的约 262 mV 是窄带 IIR 算的，那只滤波器在 8 kHz 上会把 200 Hz 漏进 6–16 Hz。冲击用 Welch 的数，只加在参考麦上。
 
-回流取抵消档：{f_gain:.3f} mV/码，参考麦晚 {f_lag:.2f} 个样本（{f_deg:.1f}°）。探针档 {g2:.3f} mV/码、{lag2:.2f} 样本，同一条增益。
+窄带回流取抵消档：{f_gain:.3f} mV/码，参考麦晚 {f_lag:.2f} 个样本（{f_deg:.1f}°）。探针档 {g2:.3f} mV/码、{lag2:.2f} 样本，同一条增益。{fir_blurb}
 
 ## 假设
 
-- 逐点：本拍算出的 DAC 从下一拍才进入两条声学路径。辨识出的 FIR 描述的是「DAC 脚上的码和同一拍的麦」，所以仿真里真路径和回流都多这 1 拍。200 Hz 上是 9°。算法内部的 Ŝ 滤波可以用到当前参考样本，那不是声学延迟。
+- 逐点：本拍算出的 DAC 从下一拍才进入两条声学路径。辨识出的 FIR 描述的是「DAC 脚上的码和同一拍的麦」，所以仿真里真路径和 FIR 回流都多这 1 拍，靠先读麦、后写 y 的缓冲实现，不再把 PLANT_LAG 加到 FIR 的分数延迟上。200 Hz 上这 1 拍是 9°。算法内部的 Ŝ 滤波可以用到当前参考样本，那不是声学延迟。
 - 更新是减号：`w ← (1−γ) w − μ e x' / (‖x'‖²+ε)`。麦上是 d 加喇叭，写成加号会往反方向走。ε = {EPS:g}。
-- 回流 F 用的是 200 Hz 上测到的增益和延迟，实现成「增益 × 分数延迟」，所以全频带都乘了同一个数。10 Hz 上真路径 |S| 只有 0.078 mV/码，这条 F 是 1.73 mV/码，比 S 大约 27 dB。离开 200 Hz 之后 F 没有测过，不能把「不加高通就发散」当成管子一定会叫。
+- 宽带 FIR-F 是 `h_ref` 与 y 的卷积，y 是去掉中点的 DAC 码，F 的单位是 mV/码。`xr = x0 + F*y`。窄带对照仍是 200 Hz 增益 × 分数延迟，全频带乘同一个数，并且同样多这 1 拍。窄带那一行只供比较。
 - 200 Hz 降噪有两个数。4 s 正弦拟合只看锁相的单音。0.25 s 相干包络的最后 4 s 中位数会把相位在漂的残差也算进去，所以比拟合浅。收敛时刻按这只包络：降到它自己的中位数 +3 dB 以内，并且接下来 0.5 s 里八成的点还在门限下。
 - 高通是因果 Butterworth，截止 80 Hz。对齐是指滤波后的 x' 再过同一只高通；失配是 x' 不过。
 - 量化：四舍五入到整数码，并限制在 −2048…2047。
@@ -756,17 +881,17 @@ def main(argv=None):
 | --- | ---: | ---: | --- | ---: | ---: |
 {chr(10).join(line_factor(r) for r in factor_rows)}
 
-「+回流」一行如果发散，末尾的 0 dB 是因为 |y| 超过 1e6 之后把输出清零了，不是它还停在开环。N=16、μ=0.01、没有高通、输出再限到 DAC 范围时，输出会一直顶在 ±2048，200 Hz 也不降。加上二阶高通之后就稳住了。一阶高通如果不把同一只高通卷进 Ŝ，这一档 μ 也会发散；卷进去就和二阶一样。
+名字带「对照 窄带fb200」的行才是旧的增益 × 分数延迟。某一行如果发散，末尾的 0 dB 是因为 |y| 超过 1e6 之后把输出清零了，不是它还停在开环。
 
-## 抽头（回流 + 二阶对齐 + 量化，μ={MU0}，γ=0）
+## 抽头（{plant_note}，{sw_name}，μ={MU0}，γ=0）
 
 | N | 4 s 拟合 | 0.25 s 窗 | 收敛 |
 | --- | ---: | ---: | --- |
 {n_txt}
 
-取稳态拟合最深、且仍 ≤ −20 dB 的 N = {N_star}。
+主结果固定 N = {N0}。表里仍 ≤ −20 dB 且拟合最深的是 {deep_txt}，不拿它替换主结果。
 
-## μ（N={N_star}，二阶对齐，量化，回流，γ=0）
+## μ（N={N0}，{sw_name}，{plant_note}，γ=0）
 
 稳定上界（能降过 10 dB 且没有顶满 DAC 的最大扫描点）= {ub if ub is not None else "没有"}。再大一档就是表里的下一个点，上界在这两档之间，没有更密的测量。
 
@@ -774,15 +899,15 @@ def main(argv=None):
 | --- | ---: | ---: | --- | ---: |
 {chr(10).join(line_mu(r) for r in mu_rows)}
 
-推荐 μ = {mu_star:g}。{pick_note}
+按旧挑选规则（能到 −20 dB 且 1 s 内收敛的最小稳定 μ）得到 {scan_txt}。主结果仍是 μ = {MU0:g}。{pick_note}
 
-## 泄漏（在推荐 μ 上）
+## 泄漏（N={N0}，μ={MU0:g}）
 
 | γ | 4 s 拟合 | 0.25 s 窗 | 收敛 |
 | --- | ---: | ---: | --- |
 {g_txt}
 
-推荐 γ = 0。γ=0 已经在 1 s 内收敛。1e-6 和 0 没有差别，1e-5 开始把 4 s 拟合变浅。不拿深度去换泄漏。
+主结果保持 γ = 0，不按这张表改。
 
 ## Ŝ 相位误差
 
@@ -800,9 +925,9 @@ def main(argv=None):
 | --- | ---: | ---: | --- | ---: | ---: |
 {sh_txt}
 
-`1/(‖x'‖²+ε)` 变小就是归一化步长被压短。无冲击、二阶高通那次是 {head['inv']:.3e}。
+`1/(‖x'‖²+ε)` 变小就是归一化步长被压短。无冲击、主结果那次是 {head['inv']:.3e}。
 
-## 副作用（推荐的那一次，最后 8 s）
+## 副作用（主结果那一次，最后 8 s）
 
 | Hz | 关 dB | 开 dB | 开−关 |
 | --- | ---: | ---: | ---: |
@@ -812,17 +937,17 @@ def main(argv=None):
 
 ## 保护
 
-| 情况 | 静音时刻 s | 触发前 \|e\| 峰值 mV | 数值炸掉 | 末尾 200 Hz |
+| 情况 | 静音时刻 s | 触发前 \\|e\\| 峰值 mV | 数值炸掉 | 末尾 200 Hz |
 | --- | ---: | ---: | ---: | ---: |
 {pr_txt}
 
 静音时刻从仿真起点算。NaN 表示这 20 s 里规则没有触发。阈值是开环 rms 的 2 倍，连续 4 个 50 ms 窗，最快 0.20 s。末尾 200 Hz 在静音之后回到开环，所以是 0 dB 左右，不代表没检测到。
 
-## 推荐和合格线
+## 主结果
 
-推荐：N = {N_star}，μ = {mu_star:g}，γ = {g_star:g}，二阶 80 Hz 因果高通并且卷进 Ŝ，DAC 限幅 −2048…2047 码。末尾 4 s 的 y 峰值 {head['peak']:.1f} 码，整段峰值 {head['peak_all']:.0f} 码。{"起头碰到过限幅。" if head["peak_all"] >= DAC_LIM else "没有碰到限幅。"}
+植物是 {plant_note}。控制器固定为 N = {N0}，μ = {MU0:g}，γ = {G0:g}，{sw_name}，DAC 限到 −2048…2047。对应表里的「{headline_name}」。末尾 4 s 的 y 峰值 {head['peak']:.1f} 码，整段峰值 {head['peak_all']:.0f} 码。{"起头碰到过限幅。" if head["peak_all"] >= DAC_LIM else "没有碰到限幅。"}
 
-这一次：4 s 正弦拟合 {head['db']:+.1f} dB，0.25 s 窗中位数 {fmt_short(head)} dB，收敛 {fmt_tc(head['tc'])}，y rms {head['y_rms']:.2f} 码。合格线（回流、对齐后的高通、整数量化之后，两个降噪数都 ≤ −20 dB，且 1 s 内收敛）{verdict}。
+这一次：4 s 正弦拟合 {head['db']:+.1f} dB，0.25 s 窗中位数 {fmt_short(head)} dB，收敛 {fmt_tc(head['tc'])}，y rms {head['y_rms']:.2f} 码。{claim}
 
 ![200 Hz](level_200.png)
 
@@ -832,13 +957,14 @@ def main(argv=None):
 
 ## 哪些是实测，哪些是假设
 
-实测：初级路径的 200 Hz 和 600 Hz 幅度相位，残差的频谱，Ŝ 和另一段白噪声的 Ŝ，回流在 200 Hz 的复增益，DAC 码的范围，采样率。
+实测：初级路径的 200 Hz 和 600 Hz 幅度相位，残差的频谱，Ŝ 和另一段白噪声的 Ŝ，窄带回流在 200 Hz 的复增益，若 `shat.npz` 里有 `h_ref` 则还有 DAC→参考麦的 384 阶 FIR，DAC 码的范围，采样率。
 
-假设：20 s 噪声是按谱重新抽的，不是那半秒的重复；F 在 200 Hz 以外等于同一个增益和延迟；逐点多 1 拍；高通阶数和截止是预定的，不是从板上拆出来的；保护阈值是这里定的；碰管子只加在参考麦上。
+假设：20 s 噪声是按谱重新抽的，不是那半秒的重复；宽带 FIR 在辨识用的噪声带里代表这条回流；窄带对照在 200 Hz 以外仍是同一个增益和延迟；逐点多 1 拍；高通阶数和截止是预定的，不是从板上拆出来的；保护阈值是这里定的；碰管子只加在参考麦上。
 """
     (out / "report.md").write_text(text, encoding="utf-8")
     print("saved", out)
-    print("HEAD", fmt_db(head), fmt_tc(head["tc"]), "pass" if pass_db else "FAIL")
+    tag = "宽带 FIR-F，不是旧窄带 F 的官方合格判定" if use_fir else "窄带 fb200（没有 h_ref）"
+    print("HEAD", tag, fmt_db(head), fmt_tc(head["tc"]))
 
 
 if __name__ == "__main__":

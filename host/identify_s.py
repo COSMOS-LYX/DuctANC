@@ -37,7 +37,11 @@ def load(name: str):
 
 
 def pooled(recs, ch: int, n_taps: int) -> np.ndarray:
-    """三段各自去掉直流后叠在一起做最小二乘，段与段的接缝不进方程。"""
+    """多段各自去掉直流后叠在一起做最小二乘，段与段的接缝不进方程。
+
+    ch=1 是误差麦（Ŝ / h_err），ch=0 是参考麦（回流 FIR / h_ref）。
+    回归量是 DAC 码，不是另一只麦。h[k] 乘的是早 k 个样本的 DAC，k=0 与麦同一拍。
+    """
     xs, ys = [], []
     for u, mv in recs:
         uu = np.ascontiguousarray(u - u.mean())
@@ -46,6 +50,46 @@ def pooled(recs, ch: int, n_taps: int) -> np.ndarray:
         ys.append(yy[n_taps - 1:])
     h, *_ = np.linalg.lstsq(np.vstack(xs), np.concatenate(ys), rcond=None)
     return h
+
+
+def fit_secondary(recs, n_taps: int = N_TAPS):
+    """官方 P2 拟合。recs 是 (u, mv)，mv 第 0 列参考麦、第 1 列误差麦。
+
+    返回 (h_err, h_ref)，都是 n_taps 阶，单位与 mv、u 一致（记录里是 mV / DAC 码）。
+    两条通路用同一次 pooled LS，段间接缝不进方程。
+    """
+    recs = list(recs)
+    return pooled(recs, 1, n_taps), pooled(recs, 0, n_taps)
+
+
+def save_fit(path, h_err, h_ref, sources=()) -> None:
+    """写入 shat.npz。h_ref 与 h_err 一起存。旧文件可以只有 h_err，见 load_fit。"""
+    np.savez(
+        path,
+        h_err=np.asarray(h_err, np.float64),
+        h_ref=np.asarray(h_ref, np.float64),
+        fs=np.int64(FS),
+        n_taps=np.int64(len(h_err)),
+        sources=np.asarray(list(sources)),
+    )
+
+
+def load_fit(path):
+    """返回 (h_err, h_ref)。没有 h_ref 键时 h_ref 是 None，不把缺省当成全零。"""
+    z = np.load(path)
+    try:
+        h_err = np.asarray(z["h_err"], np.float64)
+        h_ref = np.asarray(z["h_ref"], np.float64) if "h_ref" in z.files else None
+    finally:
+        z.close()
+    return h_err, h_ref
+
+
+def tone_response(h, hz: float = 200.0, fs: float = FS, nfft: int = 16384):
+    """FIR 在 hz 上的 (频率 Hz, 幅度, 相位 °)。幅度单位与 h 相同。同一拍卷积，不含仿真多加的 1 拍。"""
+    f = np.fft.rfftfreq(nfft, 1.0 / fs)
+    H = np.fft.rfft(np.asarray(h, np.float64), nfft)
+    return at(f, H, hz)
 
 
 def predict(u, h):
@@ -77,8 +121,7 @@ def at(f, H, hz):
 def main():
     recs = [load(n) for n in SOURCES]
     early = [load(n) for n in EARLY]
-    h = pooled(recs, 1, N_TAPS)
-    hf = pooled(recs, 0, N_TAPS)
+    h, hf = fit_secondary(recs, N_TAPS)
     f, H = resp(h)
     _, F = resp(hf)
 
@@ -128,11 +171,7 @@ def main():
     f200 = at(f, F, 200)
 
     d = hwtest.new_record_dir("p2shat")
-    np.savez(
-        d / "shat.npz",
-        h_err=h, h_ref=hf, fs=FS, n_taps=N_TAPS,
-        sources=np.array(SOURCES),
-    )
+    save_fit(d / "shat.npz", h, hf, sources=SOURCES)
     plot(d / "shat.png", h, f, H)
     write_report(d / "report.md", loo, gaps, order, s200, peak_rows, s350, f200,
                  meas_amp, pred_amp, dphi, early_nmse)
@@ -191,7 +230,7 @@ def write_report(path, loo, gaps, order, s200, peaks, s350, f200,
 
 100–400 Hz 里 |Ŝ| 高于 20 mV/码的峰：{peak_s}。350 Hz 处 {s350[1]:.2f} mV/码，比 200 Hz 低 {drop:.0f} dB。232 Hz 是次级路径自己的峰，不是回流放大倍数的测量；参考麦那条回路的相干只有 0.5 左右，不能据此说圈在那儿更大。
 
-同一拟合给出的参考麦通路 `h_ref` 在 200 Hz 是 {f200[1]:.2f} mV/码、{f200[2]:+.1f}°，和回流测量的 1.74 mV/码同一量级。参考麦里还有一半以上能量和 DAC 不相干，`h_ref` 只描述其中对得上的那部分。
+同一拟合给出的参考麦通路 `h_ref`（384 阶，整段都在 `shat.npz`）在 200 Hz 是 {f200[1]:.2f} mV/码、{f200[2]:+.1f}°，和回流测量的 1.74 mV/码同一量级。参考麦里还有一半以上能量和 DAC 不相干，`h_ref` 只描述其中对得上的那部分。读旧的 `shat.npz` 时如果没有 `h_ref` 这个键，就当成还没有宽带 FIR，不要当成全零。
 
 ![shat](shat.png)
 """

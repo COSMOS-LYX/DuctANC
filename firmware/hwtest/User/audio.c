@@ -538,6 +538,26 @@ uint32_t audio_anc_shat_crc(void)
     return anc_shat_crc(anc_state());
 }
 
+int audio_anc_fref_chunk(int index, const float *v, int n)
+{
+    if (anc_on)
+        return 0;
+    return anc_fref_chunk(index, v, n);
+}
+
+int audio_anc_fref_reset(void)
+{
+    if (anc_on)
+        return 0;
+    anc_fref_clear();
+    return 1;
+}
+
+uint32_t audio_anc_fref_crc(void)
+{
+    return anc_fref_crc();
+}
+
 int audio_xchk(const uint16_t *ref, float *xf, int n)
 {
     if (anc_on || n <= 0 || n > 400)

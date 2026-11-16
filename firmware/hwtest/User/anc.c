@@ -40,6 +40,10 @@ struct anc {
 
 static anc_t g_anc;
 
+/* 与 anc_t 分开，避免 anc_init / anc_replay 的临时状态把已下发的 h_ref 清掉。anc_step 不读。 */
+static float g_fref[ANC_SHAT];
+static uint64_t g_fref_mask;
+
 anc_t *anc_state(void)
 {
     return &g_anc;
@@ -143,6 +147,36 @@ uint32_t anc_shat_crc(const anc_t *s)
 const float *anc_shat(const anc_t *s)
 {
     return s->shat;
+}
+
+void anc_fref_clear(void)
+{
+    memset(g_fref, 0, sizeof g_fref);
+    g_fref_mask = 0;
+}
+
+int anc_fref_chunk(int index, const float *v, int n)
+{
+    if (n != 8 || index < 0 || (index % 8) != 0 || index + n > ANC_SHAT)
+        return 0;
+    memcpy(&g_fref[index], v, (size_t)n * sizeof(float));
+    g_fref_mask |= 1ull << (index / 8);
+    return 1;
+}
+
+int anc_fref_ready(void)
+{
+    return g_fref_mask == ((1ull << (ANC_SHAT / 8)) - 1ull);
+}
+
+uint32_t anc_fref_crc(void)
+{
+    return crc32_bytes(g_fref, sizeof g_fref);
+}
+
+const float *anc_fref(void)
+{
+    return g_fref;
 }
 
 void anc_set_mu(anc_t *s, float mu) { s->mu = mu; }
