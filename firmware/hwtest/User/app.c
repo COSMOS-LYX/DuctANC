@@ -343,6 +343,39 @@ static void cmd_shat(int argc, char **argv)
               (unsigned long)audio_anc_shat_crc());
 }
 
+/* 与 SHAT 同一帧格式。h_ref 不参与 anc_step。 */
+static void cmd_fref(int argc, char **argv)
+{
+    if (argc >= 2) {
+        for (char *p = argv[1]; *p; p++)
+            *p = (char)toupper((unsigned char)*p);
+    }
+    if (argc == 2 && !strcmp(argv[1], "RST")) {
+        if (!audio_anc_fref_reset()) {
+            bt_printf("ERR fref anc on\r\n");
+            return;
+        }
+        bt_printf("OK fref rst\r\n");
+        return;
+    }
+    if (argc == 2 && !strcmp(argv[1], "CRC")) {
+        bt_printf("OK fref crc=%08lX ready=%d\r\n", (unsigned long)audio_anc_fref_crc(),
+                  anc_fref_ready());
+        return;
+    }
+    float idx = 0.0f, v[8];
+    if (argc != 3 || !parse_f(argv[1], &idx) || !parse_hex_f32(argv[2], v, 8)) {
+        bt_printf("ERR usage: FREF RST | FREF CRC | FREF <index> <64hex>\r\n");
+        return;
+    }
+    if (!audio_anc_fref_chunk((int)idx, v, 8)) {
+        bt_printf("ERR fref rejected\r\n");
+        return;
+    }
+    bt_printf("OK fref index=%d ready=%d crc=%08lX\r\n", (int)idx, anc_fref_ready(),
+              (unsigned long)audio_anc_fref_crc());
+}
+
 static void cmd_anc(int argc, char **argv)
 {
     char sub[12] = {0};
@@ -486,6 +519,7 @@ static const cmd_t cmds[] = {
     {"CARM", cmd_carm, "<frames> [D]  start a capture and return at once"},
     {"CGET", cmd_cget, "dump the armed capture after it fills"},
     {"SHAT", cmd_shat, "RST | CRC | <index> <64hex>  load 8 float32 of S_eff"},
+    {"FREF", cmd_fref, "RST | CRC | <index> <64hex>  store 8 float32 of h_ref; not used by FxNLMS"},
     {"ANC", cmd_anc, "ON | OFF | STATUS  FxNLMS, default off"},
     {"MU", cmd_mu, "<0..5>  NLMS step, default 0.002"},
     {"GAMMA", cmd_gamma, "<0..0.01>  leakage, default 0"},

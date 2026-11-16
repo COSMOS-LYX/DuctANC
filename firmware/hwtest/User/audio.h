@@ -76,6 +76,10 @@ void audio_anc_stat(audio_anc_stat_t *out); /* 读完把 lag 峰值清掉，方�
 int audio_anc_shat_chunk(int index, const float *v, int n);
 int audio_anc_shat_reset(void); /* ANC 开着时拒绝 */
 uint32_t audio_anc_shat_crc(void);
+/* h_ref 只存储。格式同 SHAT。ANC 开着时拒绝。不进 anc_step。 */
+int audio_anc_fref_chunk(int index, const float *v, int n);
+int audio_anc_fref_reset(void);
+uint32_t audio_anc_fref_crc(void);
 /* ANC 必须关着。把 ref 码重放进同一只高通和 Ŝ_eff，写出 x'。n 上限 400。 */
 int audio_xchk(const uint16_t *ref, float *xf, int n);
 

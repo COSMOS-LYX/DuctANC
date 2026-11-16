@@ -45,6 +45,40 @@ def load_h_err(path: Path = SHAT_NPZ) -> np.ndarray:
     return h
 
 
+def load_h_ref(path: Path = SHAT_NPZ) -> np.ndarray | None:
+    """DAC→参考麦的 384 阶 FIR。旧 shat.npz 只有 h_err 时返回 None。"""
+    z = np.load(path)
+    try:
+        if "h_ref" not in z.files:
+            return None
+        h = np.asarray(z["h_ref"], np.float64)
+    finally:
+        z.close()
+    if h.shape != (N_SHAT,):
+        raise ValueError(f"h_ref 长度是 {h.shape}，要 {N_SHAT}")
+    return h
+
+
+def fref_f32(h_ref: np.ndarray) -> np.ndarray:
+    """下发用的原始 h_ref，float32，单位 mV/码。不卷控制器高通。
+
+    和 Ŝ_eff 不同：Ŝ_eff 是 h_err 与二阶高通卷积后的前 384 点。
+    h_ref 是植物模型，固件只保存，anc_step 不用它做中和。
+    """
+    h = np.asarray(h_ref, np.float64)
+    if h.shape != (N_SHAT,):
+        raise ValueError(f"h_ref 长度是 {h.shape}，要 {N_SHAT}")
+    return np.ascontiguousarray(h, dtype=np.float32)
+
+
+def coef_chunks(coeff: np.ndarray) -> list[tuple[int, str]]:
+    """8 个小端 float32 为一块，hex 与固件 parse_hex_f32 一致。"""
+    raw = np.ascontiguousarray(coeff, dtype="<f4")
+    if raw.shape != (N_SHAT,):
+        raise ValueError(f"系数长度是 {raw.shape}，要 {N_SHAT}")
+    return [(i, raw[i:i + 8].tobytes().hex()) for i in range(0, N_SHAT, 8)]
+
+
 def highpass_ir(n: int = 4096) -> np.ndarray:
     """同一组 float32 系数的冲激响应，float64 只用于决定截多长。"""
     b = np.array([HP_B[0], HP_B[1], HP_B[2], 0, 0], np.float64)[:3]

@@ -23,6 +23,19 @@ uint32_t anc_shat_crc(const anc_t *s);
 void anc_shat_clear(anc_t *s);
 const float *anc_shat(const anc_t *s);
 
+/*
+ * 宽带回流 FIR h_ref：DAC → 参考麦，384 阶，单位与辨识相同（mV/码）。
+ * h[k] 是参考麦相对同一拍 DAC 晚 k 个样本。只保存在 g_fref，anc_step 不读，
+ * 控制器仍是现有 FxNLMS，不做单频或 FIR 中和。
+ * 线上格式与 SHAT 相同，命令名 FREF：RST | CRC | <index> <64hex 小端 float32>。
+ * 旧镜像没有 FREF 时上位机跳过，不要求本改动先烧录。
+ */
+int anc_fref_chunk(int index, const float *v, int n);
+int anc_fref_ready(void);
+uint32_t anc_fref_crc(void);
+void anc_fref_clear(void);
+const float *anc_fref(void);
+
 void anc_set_mu(anc_t *s, float mu);
 void anc_set_gamma(anc_t *s, float gamma);
 void anc_set_clamp(anc_t *s, float clamp);

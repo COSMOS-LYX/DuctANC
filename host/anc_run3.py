@@ -68,7 +68,8 @@ def main():
             st = dev.anc_status()
         if st.get("shat") != "1":
             coeff, _ = ac.shat_eff()
-            anc_p4.upload(dev, coeff)
+            href = ac.load_h_ref()
+            anc_p4.upload(dev, coeff, None if href is None else ac.fref_f32(href))
             st = dev.anc_status()
         if st.get("on") != "0":
             raise SystemExit(f"ANC 已经开着: {st}")
